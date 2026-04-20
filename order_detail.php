@@ -253,14 +253,22 @@ $deriveShippingStatus = static function (array $ctx): string {
     }
 
     $orderStatus = strtolower(trim((string)($ctx['order_status'] ?? '')));
-    if (in_array($orderStatus, ['delivered', 'completed'], true)) {
-        return 'delivered';
-    }
-    if (in_array($orderStatus, ['shipped', 'in_transit', 'out_for_delivery'], true)) {
-        return 'shipped';
-    }
-    if (in_array($orderStatus, ['processing', 'ready_to_ship', 'packed'], true)) {
-        return 'processing';
+    $derivedMap = [
+        'paid' => 'to_ship',
+        'confirmed' => 'to_ship',
+        'ready_to_ship' => 'to_ship',
+        'packed' => 'processing',
+        'processing' => 'processing',
+        'shipped' => 'shipped',
+        'in_transit' => 'shipped',
+        'out_for_delivery' => 'shipped',
+        'delivered' => 'delivered',
+        'completed' => 'delivered',
+        'cancelled' => 'cancelled',
+        'refunded' => 'cancelled',
+    ];
+    if (isset($derivedMap[$orderStatus])) {
+        return $derivedMap[$orderStatus];
     }
     return 'pending';
 };
@@ -268,6 +276,7 @@ $deriveShippingStatus = static function (array $ctx): string {
 $shippingBadge = static function (string $status): array {
     $key = strtolower(trim($status));
     $map = [
+        'to_ship' => ['To Ship', 'offer-thread-badge-ready'],
         'pending' => ['Pending', 'offer-thread-badge-open'],
         'processing' => ['Processing', 'offer-thread-badge-ready'],
         'ready_to_ship' => ['Ready to Ship', 'offer-thread-badge-ready'],
@@ -275,9 +284,11 @@ $shippingBadge = static function (string $status): array {
         'in_transit' => ['In Transit', 'offer-thread-badge-completed'],
         'out_for_delivery' => ['Out for Delivery', 'offer-thread-badge-completed'],
         'delivered' => ['Delivered', 'offer-thread-badge-completed'],
-        'cancelled' => ['Cancelled', 'offer-thread-badge-needs-reply'],
+        'cancelled' => ['Closed', 'offer-thread-badge-needs-reply'],
+        'refunded' => ['Closed', 'offer-thread-badge-needs-reply'],
+        'closed' => ['Closed', 'offer-thread-badge-needs-reply'],
         'returned' => ['Returned', 'offer-thread-badge-needs-reply'],
-    ];
+    ]; 
     if (isset($map[$key])) {
         return ['label' => $map[$key][0], 'class' => $map[$key][1]];
     }
@@ -325,9 +336,23 @@ if (isset($orderContext['items']) && is_array($orderContext['items'])) {
         if (!is_array($itemRow)) {
             continue;
         }
-        if (isset($itemRow['seller_user_id']) && (int)$itemRow['seller_user_id'] !== $sellerUserId) {
+        $sellerKeyFound = false;
+        $belongsToSeller = true;
+        foreach (['seller_user_id', 'seller_id', 'owner_user_id', 'user_id'] as $sellerKey) {
+            if (!array_key_exists($sellerKey, $itemRow)) {
+                continue;
+            }
+            $sellerValue = $itemRow[$sellerKey];
+            if (is_numeric($sellerValue)) {
+                $sellerKeyFound = true;
+                $belongsToSeller = ((int)$sellerValue === $sellerUserId);
+                break;
+            }
+        }
+        if ($sellerKeyFound && !$belongsToSeller) {
             continue;
         }
+
         $lineTotal = null;
         foreach (['line_total', 'subtotal', 'item_total', 'total'] as $lineKey) {
             if (isset($itemRow[$lineKey]) && is_numeric($itemRow[$lineKey])) {
@@ -335,8 +360,24 @@ if (isset($orderContext['items']) && is_array($orderContext['items'])) {
                 break;
             }
         }
-        if ($lineTotal === null && isset($itemRow['unit_price'], $itemRow['quantity']) && is_numeric($itemRow['unit_price']) && is_numeric($itemRow['quantity'])) {
-            $lineTotal = (float)$itemRow['unit_price'] * (float)$itemRow['quantity'];
+        if ($lineTotal === null) {
+            $unitPrice = null;
+            if (isset($itemRow['unit_price']) && is_numeric($itemRow['unit_price'])) {
+                $unitPrice = (float)$itemRow['unit_price'];
+            } elseif (isset($itemRow['price']) && is_numeric($itemRow['price'])) {
+                $unitPrice = (float)$itemRow['price'];
+            }
+
+            $qty = null;
+            if (isset($itemRow['quantity']) && is_numeric($itemRow['quantity'])) {
+                $qty = (float)$itemRow['quantity'];
+            } elseif (isset($itemRow['qty']) && is_numeric($itemRow['qty'])) {
+                $qty = (float)$itemRow['qty'];
+            }
+
+            if ($unitPrice !== null && $qty !== null) {
+                $lineTotal = $unitPrice * $qty;
+            }
         }
         if ($lineTotal !== null) {
             $subtotal += $lineTotal;
@@ -348,17 +389,32 @@ if (isset($orderContext['items']) && is_array($orderContext['items'])) {
     }
 }
 
-$actionEndpoint = '/seller/order_request_action.php';
-$actionEndpointExists = false;
-$actionCandidates = [
+$requestActionEndpoint = '/seller/order_request_action.php';
+$requestActionEndpointExists = false;
+$requestActionCandidates = [
     __DIR__ . '/order_request_action.php',
     __DIR__ . '/includes/order_request_action.php',
     dirname(__DIR__) . '/seller/order_request_action.php',
     dirname(__DIR__) . '/order_request_action.php',
 ];
-foreach ($actionCandidates as $candidatePath) {
+foreach ($requestActionCandidates as $candidatePath) {
     if (is_file($candidatePath)) {
-        $actionEndpointExists = true;
+        $requestActionEndpointExists = true;
+        break;
+    }
+}
+
+$fulfillmentActionEndpoint = '/seller/order_action.php';
+$fulfillmentActionEndpointExists = false;
+$fulfillmentActionCandidates = [
+    __DIR__ . '/order_action.php',
+    __DIR__ . '/includes/order_action.php',
+    dirname(__DIR__) . '/seller/order_action.php',
+    dirname(__DIR__) . '/order_action.php',
+];
+foreach ($fulfillmentActionCandidates as $candidatePath) {
+    if (is_file($candidatePath)) {
+        $fulfillmentActionEndpointExists = true;
         break;
     }
 }
@@ -394,6 +450,24 @@ $currentRefundRef = $pickValue($currentRow, ['payment_reference_snapshot', 'paym
 
 $cancelBadge = $statusBadge('cancel', strtolower(trim((string)($cancelRow['status'] ?? ''))));
 $refundBadge = $statusBadge('refund', strtolower(trim((string)($refundRow['status'] ?? ''))));
+
+$orderStatus = strtolower(trim((string)($orderContext['order_status'] ?? '')));
+$paymentStatusKey = strtolower(trim((string)$paymentStatus));
+$shippingStatusKey = strtolower(trim((string)$shippingStatus));
+$fulfillmentActions = [];
+if (in_array($paymentStatusKey, ['paid', 'authorized'], true) && in_array($orderStatus, ['paid', 'confirmed'], true)) {
+    $fulfillmentActions[] = ['label' => 'Mark Processing', 'value' => 'mark_processing', 'class' => 'btn-approve'];
+}
+if (
+    $orderStatus === 'processing'
+    || $shippingStatusKey === 'to_ship'
+    || $shippingStatusKey === 'processing'
+) {
+    $fulfillmentActions[] = ['label' => 'Mark Shipped', 'value' => 'mark_shipped', 'class' => 'btn-approve'];
+}
+if ($orderStatus === 'shipped' || $shippingStatusKey === 'shipped') {
+    $fulfillmentActions[] = ['label' => 'Mark Completed', 'value' => 'mark_completed', 'class' => 'btn-approve'];
+}
 ?>
 <!doctype html>
 <html lang="en">
@@ -646,32 +720,60 @@ $refundBadge = $statusBadge('refund', strtolower(trim((string)($refundRow['statu
 
     <section class="card actions">
         <h2>Take Action</h2>
-        <?php if (!$actionEndpointExists): ?>
-            <div class="empty">Read-only mode: seller action endpoint is not available in this environment.</div>
-        <?php elseif (!$canApproveCancel && !$canRejectCancel && !$canApproveRefund && !$canRejectRefund): ?>
-            <div class="empty">No actions are currently available for this request state.</div>
-        <?php else: ?>
-            <form method="post" action="<?= $h($actionEndpoint) ?>" class="stack">
-                <input type="hidden" name="order_id" value="<?= $h((string)$orderId) ?>">
-                <input type="hidden" name="csrf_token" value="<?= $h($csrfToken) ?>">
-                <label for="note" class="muted">Note (optional)</label>
-                <textarea id="note" name="note" placeholder="Add a note for approval/rejection logs"></textarea>
+        <div class="stack">
+            <h3>Cancel / Refund Request Actions</h3>
+            <?php if (!$requestActionEndpointExists): ?>
+                <div class="empty">Read-only mode: seller request action endpoint is not available in this environment.</div>
+            <?php elseif (!$canApproveCancel && !$canRejectCancel && !$canApproveRefund && !$canRejectRefund): ?>
+                <div class="empty">No actions are currently available for this request state.</div>
+            <?php else: ?>
+                <form method="post" action="<?= $h($requestActionEndpoint) ?>" class="stack">
+                    <input type="hidden" name="order_id" value="<?= $h((string)$orderId) ?>">
+                    <input type="hidden" name="csrf_token" value="<?= $h($csrfToken) ?>">
+                    <label for="note" class="muted">Note (optional)</label>
+                    <textarea id="note" name="note" placeholder="Add a note for approval/rejection logs"></textarea>
+                    <div class="action-row">
+                        <?php if ($canApproveCancel): ?>
+                            <button type="submit" class="btn-approve" name="action" value="approve_cancel">Approve Cancel</button>
+                        <?php endif; ?>
+                        <?php if ($canRejectCancel): ?>
+                            <button type="submit" class="btn-reject" name="action" value="reject_cancel">Reject Cancel</button>
+                        <?php endif; ?>
+                        <?php if ($canApproveRefund): ?>
+                            <button type="submit" class="btn-approve" name="action" value="approve_refund">Approve Refund</button>
+                        <?php endif; ?>
+                        <?php if ($canRejectRefund): ?>
+                            <button type="submit" class="btn-reject" name="action" value="reject_refund">Reject Refund</button>
+                        <?php endif; ?>
+                    </div>
+                </form>
+            <?php endif; ?>
+        </div>
+
+        <div class="stack">
+            <h3>Order Fulfillment Actions</h3>
+            <?php if (!$fulfillmentActionEndpointExists): ?>
+                <div class="empty">Fulfillment actions are not enabled yet for this environment.</div>
+            <?php elseif (empty($fulfillmentActions)): ?>
+                <div class="empty">No fulfillment actions are currently available for this order state.</div>
+            <?php else: ?>
                 <div class="action-row">
-                    <?php if ($canApproveCancel): ?>
-                        <button type="submit" class="btn-approve" name="action" value="approve_cancel">Approve Cancel</button>
-                    <?php endif; ?>
-                    <?php if ($canRejectCancel): ?>
-                        <button type="submit" class="btn-reject" name="action" value="reject_cancel">Reject Cancel</button>
-                    <?php endif; ?>
-                    <?php if ($canApproveRefund): ?>
-                        <button type="submit" class="btn-approve" name="action" value="approve_refund">Approve Refund</button>
-                    <?php endif; ?>
-                    <?php if ($canRejectRefund): ?>
-                        <button type="submit" class="btn-reject" name="action" value="reject_refund">Reject Refund</button>
-                    <?php endif; ?>
+                    <?php foreach ($fulfillmentActions as $fulfillmentAction): ?>
+                        <form method="post" action="<?= $h($fulfillmentActionEndpoint) ?>">
+                            <input type="hidden" name="csrf_token" value="<?= $h($csrfToken) ?>">
+                            <input type="hidden" name="order_id" value="<?= $h((string)$orderId) ?>">
+                            <input type="hidden" name="return_url" value="<?= $h($returnUrl) ?>">
+                            <button
+                                type="submit"
+                                class="<?= $h((string)($fulfillmentAction['class'] ?? '')) ?>"
+                                name="action"
+                                value="<?= $h((string)($fulfillmentAction['value'] ?? '')) ?>"
+                            ><?= $h((string)($fulfillmentAction['label'] ?? 'Action')) ?></button>
+                        </form>
+                    <?php endforeach; ?>
                 </div>
-            </form>
-        <?php endif; ?>
+            <?php endif; ?>
+        </div>
     </section>
 </div>
 </body>
