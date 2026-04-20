@@ -16,12 +16,36 @@ foreach ($guardCandidates as $guardFile) {
 }
 
 $requiredHelper = __DIR__ . '/includes/order_request_actions.php';
+$helperLoaded = false;
 if (!is_file($requiredHelper)) {
     http_response_code(500);
     echo 'Order helper unavailable.';
     exit;
 }
 require_once $requiredHelper;
+$helperLoaded = true;
+
+$debugLog = static function (array $payload): void {
+    $line = '[' . gmdate('Y-m-d H:i:s') . " UTC] seller_order_detail " . json_encode($payload, JSON_UNESCAPED_SLASHES) . PHP_EOL;
+    $logCandidates = [
+        '/private_html/seller_order_detail_debug.log',
+        '/public_html/seller_order_detail_debug.log',
+        dirname(__DIR__) . '/private_html/seller_order_detail_debug.log',
+        dirname(__DIR__) . '/public_html/seller_order_detail_debug.log',
+        __DIR__ . '/seller_order_detail_debug.log',
+    ];
+
+    foreach ($logCandidates as $logFile) {
+        $logDir = dirname($logFile);
+        if (!is_dir($logDir)) {
+            continue;
+        }
+        if (is_file($logFile) || is_writable($logDir)) {
+            @file_put_contents($logFile, $line, FILE_APPEND);
+            return;
+        }
+    }
+};
 
 $optionalHelpers = [
     __DIR__ . '/includes/cancel_refund_summary.php',
@@ -51,14 +75,32 @@ if ($orderId <= 0 || $sellerUserId <= 0) {
     exit;
 }
 
+$ownershipPassed = null;
 if (function_exists('seller_order_request_order_belongs_to_seller')) {
     try {
-        if (!seller_order_request_order_belongs_to_seller($orderId, $sellerUserId)) {
+        $ownershipPassed = (bool)seller_order_request_order_belongs_to_seller($orderId, $sellerUserId);
+        if (!$ownershipPassed) {
+            $debugLog([
+                'order_id' => $orderId,
+                'seller_user_id' => $sellerUserId,
+                'helper_loaded' => $helperLoaded,
+                'context_loaded' => false,
+                'ownership_passed' => false,
+                'exception' => '',
+            ]);
             http_response_code(404);
             echo 'Order not found.';
             exit;
         }
     } catch (Throwable $e) {
+        $debugLog([
+            'order_id' => $orderId,
+            'seller_user_id' => $sellerUserId,
+            'helper_loaded' => $helperLoaded,
+            'context_loaded' => false,
+            'ownership_passed' => false,
+            'exception' => $e->getMessage(),
+        ]);
         http_response_code(404);
         echo 'Order not found.';
         exit;
@@ -86,6 +128,7 @@ $bundle = [
     'seller_can_reject_refund' => false,
 ];
 
+$loadExceptionMessage = '';
 try {
     if (function_exists('seller_order_request_get_order_context')) {
         $orderContext = seller_order_request_get_order_context($orderId, $sellerUserId);
@@ -104,7 +147,7 @@ try {
         }
     }
 } catch (Throwable $e) {
-    // keep safe defaults
+    $loadExceptionMessage = $e->getMessage();
 }
 
 if (!$orderContext && is_array($bundle['order'] ?? null)) {
@@ -112,10 +155,27 @@ if (!$orderContext && is_array($bundle['order'] ?? null)) {
 }
 
 if (!$orderContext || !is_array($orderContext)) {
+    $debugLog([
+        'order_id' => $orderId,
+        'seller_user_id' => $sellerUserId,
+        'helper_loaded' => $helperLoaded,
+        'context_loaded' => false,
+        'ownership_passed' => $ownershipPassed,
+        'exception' => $loadExceptionMessage,
+    ]);
     http_response_code(404);
     echo 'Order not found.';
     exit;
 }
+
+$debugLog([
+    'order_id' => $orderId,
+    'seller_user_id' => $sellerUserId,
+    'helper_loaded' => $helperLoaded,
+    'context_loaded' => true,
+    'ownership_passed' => $ownershipPassed,
+    'exception' => $loadExceptionMessage,
+]);
 
 $cancelRow = is_array($bundle['cancel'] ?? null) ? $bundle['cancel'] : null;
 $refundRow = is_array($bundle['refund'] ?? null) ? $bundle['refund'] : null;
@@ -160,6 +220,70 @@ $statusBadge = static function (string $type, string $status): array {
     return ['label' => $label, 'class' => 'badge-default'];
 };
 
+$paymentBadge = static function (string $status): array {
+    $key = strtolower(trim($status));
+    $map = [
+        'paid' => ['Paid', 'offer-thread-badge-completed'],
+        'completed' => ['Completed', 'offer-thread-badge-completed'],
+        'authorized' => ['Authorized', 'offer-thread-badge-ready'],
+        'pending' => ['Pending', 'offer-thread-badge-open'],
+        'unpaid' => ['Unpaid', 'offer-thread-badge-needs-reply'],
+        'failed' => ['Failed', 'offer-thread-badge-needs-reply'],
+        'refunded' => ['Refunded', 'offer-thread-badge-ready'],
+        'partially_refunded' => ['Partially Refunded', 'offer-thread-badge-open'],
+    ];
+    if (isset($map[$key])) {
+        return ['label' => $map[$key][0], 'class' => $map[$key][1]];
+    }
+    return ['label' => $key !== '' ? ucfirst(str_replace('_', ' ', $key)) : 'Unknown', 'class' => 'badge-default'];
+};
+
+$deriveShippingStatus = static function (array $ctx): string {
+    $candidates = [
+        'shipping_status',
+        'delivery_status',
+        'tracking_status',
+        'fulfillment_status',
+        'order_shipping_status',
+    ];
+    foreach ($candidates as $key) {
+        if (isset($ctx[$key]) && trim((string)$ctx[$key]) !== '') {
+            return strtolower(trim((string)$ctx[$key]));
+        }
+    }
+
+    $orderStatus = strtolower(trim((string)($ctx['order_status'] ?? '')));
+    if (in_array($orderStatus, ['delivered', 'completed'], true)) {
+        return 'delivered';
+    }
+    if (in_array($orderStatus, ['shipped', 'in_transit', 'out_for_delivery'], true)) {
+        return 'shipped';
+    }
+    if (in_array($orderStatus, ['processing', 'ready_to_ship', 'packed'], true)) {
+        return 'processing';
+    }
+    return 'pending';
+};
+
+$shippingBadge = static function (string $status): array {
+    $key = strtolower(trim($status));
+    $map = [
+        'pending' => ['Pending', 'offer-thread-badge-open'],
+        'processing' => ['Processing', 'offer-thread-badge-ready'],
+        'ready_to_ship' => ['Ready to Ship', 'offer-thread-badge-ready'],
+        'shipped' => ['Shipped', 'offer-thread-badge-completed'],
+        'in_transit' => ['In Transit', 'offer-thread-badge-completed'],
+        'out_for_delivery' => ['Out for Delivery', 'offer-thread-badge-completed'],
+        'delivered' => ['Delivered', 'offer-thread-badge-completed'],
+        'cancelled' => ['Cancelled', 'offer-thread-badge-needs-reply'],
+        'returned' => ['Returned', 'offer-thread-badge-needs-reply'],
+    ];
+    if (isset($map[$key])) {
+        return ['label' => $map[$key][0], 'class' => $map[$key][1]];
+    }
+    return ['label' => $key !== '' ? ucfirst(str_replace('_', ' ', $key)) : 'Unknown', 'class' => 'badge-default'];
+};
+
 $pickDate = static function (?array $row): string {
     if (!$row) {
         return '';
@@ -189,6 +313,55 @@ $orderCode = trim((string)($orderContext['order_code'] ?? ''));
 $paymentStatus = trim((string)($orderContext['payment_status'] ?? ''));
 $buyerName = trim((string)($orderContext['buyer_name'] ?? ''));
 $listingTitle = trim((string)($orderContext['listing_title'] ?? ''));
+$shippingStatus = $deriveShippingStatus($orderContext);
+$paymentBadgeUi = $paymentBadge($paymentStatus);
+$shippingBadgeUi = $shippingBadge($shippingStatus);
+
+$sellerItemsSubtotal = null;
+if (isset($orderContext['items']) && is_array($orderContext['items'])) {
+    $subtotal = 0.0;
+    $hasRows = false;
+    foreach ($orderContext['items'] as $itemRow) {
+        if (!is_array($itemRow)) {
+            continue;
+        }
+        if (isset($itemRow['seller_user_id']) && (int)$itemRow['seller_user_id'] !== $sellerUserId) {
+            continue;
+        }
+        $lineTotal = null;
+        foreach (['line_total', 'subtotal', 'item_total', 'total'] as $lineKey) {
+            if (isset($itemRow[$lineKey]) && is_numeric($itemRow[$lineKey])) {
+                $lineTotal = (float)$itemRow[$lineKey];
+                break;
+            }
+        }
+        if ($lineTotal === null && isset($itemRow['unit_price'], $itemRow['quantity']) && is_numeric($itemRow['unit_price']) && is_numeric($itemRow['quantity'])) {
+            $lineTotal = (float)$itemRow['unit_price'] * (float)$itemRow['quantity'];
+        }
+        if ($lineTotal !== null) {
+            $subtotal += $lineTotal;
+            $hasRows = true;
+        }
+    }
+    if ($hasRows) {
+        $sellerItemsSubtotal = $subtotal;
+    }
+}
+
+$actionEndpoint = '/seller/order_request_action.php';
+$actionEndpointExists = false;
+$actionCandidates = [
+    __DIR__ . '/order_request_action.php',
+    __DIR__ . '/includes/order_request_action.php',
+    dirname(__DIR__) . '/seller/order_request_action.php',
+    dirname(__DIR__) . '/order_request_action.php',
+];
+foreach ($actionCandidates as $candidatePath) {
+    if (is_file($candidatePath)) {
+        $actionEndpointExists = true;
+        break;
+    }
+}
 
 $returnUrl = '/seller/apply.php';
 if (function_exists('seller_order_request_best_return_url')) {
@@ -405,9 +578,11 @@ $refundBadge = $statusBadge('refund', strtolower(trim((string)($refundRow['statu
         <h1>Seller Order Detail</h1>
         <div class="meta-grid">
             <div class="meta-item"><span class="k">Order Code</span><span class="v"><?= $h($orderCode !== '' ? $orderCode : ('#' . $orderId)) ?></span></div>
-            <div class="meta-item"><span class="k">Payment Status</span><span class="v"><?= $h($paymentStatus !== '' ? $paymentStatus : '—') ?></span></div>
+            <div class="meta-item"><span class="k">Payment Status</span><span class="v"><span class="badge <?= $h((string)($paymentBadgeUi['class'] ?? 'badge-default')) ?>"><?= $h((string)($paymentBadgeUi['label'] ?? 'Unknown')) ?></span></span></div>
+            <div class="meta-item"><span class="k">Shipping Status</span><span class="v"><span class="badge <?= $h((string)($shippingBadgeUi['class'] ?? 'badge-default')) ?>"><?= $h((string)($shippingBadgeUi['label'] ?? 'Unknown')) ?></span></span></div>
             <div class="meta-item"><span class="k">Buyer</span><span class="v"><?= $h($buyerName !== '' ? $buyerName : 'Unknown Buyer') ?></span></div>
             <div class="meta-item"><span class="k">Listing</span><span class="v"><?= $h($listingTitle !== '' ? $listingTitle : 'Listing unavailable') ?></span></div>
+            <div class="meta-item"><span class="k">Seller Items Subtotal</span><span class="v"><?= $h($sellerItemsSubtotal !== null ? $money($sellerItemsSubtotal, $currency) : '—') ?></span></div>
         </div>
     </section>
 
@@ -471,10 +646,12 @@ $refundBadge = $statusBadge('refund', strtolower(trim((string)($refundRow['statu
 
     <section class="card actions">
         <h2>Take Action</h2>
-        <?php if (!$canApproveCancel && !$canRejectCancel && !$canApproveRefund && !$canRejectRefund): ?>
+        <?php if (!$actionEndpointExists): ?>
+            <div class="empty">Read-only mode: seller action endpoint is not available in this environment.</div>
+        <?php elseif (!$canApproveCancel && !$canRejectCancel && !$canApproveRefund && !$canRejectRefund): ?>
             <div class="empty">No actions are currently available for this request state.</div>
         <?php else: ?>
-            <form method="post" action="/seller/order_request_action.php" class="stack">
+            <form method="post" action="<?= $h($actionEndpoint) ?>" class="stack">
                 <input type="hidden" name="order_id" value="<?= $h((string)$orderId) ?>">
                 <input type="hidden" name="csrf_token" value="<?= $h($csrfToken) ?>">
                 <label for="note" class="muted">Note (optional)</label>
